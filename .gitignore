@@ -3,3 +3,4 @@ wandb
 .cursor
 grpo-Qwen2.5-VL-3B-Instruct
 grpo-Qwen2.5-VL-3B-Instruct-qlora
+__pycache__
