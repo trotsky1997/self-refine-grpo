@@ -297,8 +297,7 @@ if __name__ == "__main__":
         use_critique=True,
         refine_log_file="self_refine_log.jsonl",
         return_both_responses=True,
-        micro_batch_size=8,
-        max_refine_rounds=1,  # Number of refinement rounds (1=single refine, 2+=multi-round)
+        micro_batch_size=8,  # Reduced to 1 for extremely long sequences (4096 tokens)
         peft_config=get_peft_config(model_args),
     )
     

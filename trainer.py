@@ -32,16 +32,12 @@ except ImportError:
     print("⚠️  lora_merge_triton.py not found, using standard PyTorch LoRA merge")
     TRITON_AVAILABLE = False
 
-# Import self-refine agent
-from self_refine_agent import SelfRefineAgent
-
 
 class GRPOTrainer(_GRPOTrainer):
     def __init__(self, *args, enable_self_refine: bool = False, use_critique: bool = True, 
                  refine_log_file: str = "self_refine_log.jsonl", 
                  return_both_responses: bool = False,
-                 micro_batch_size: int = None,
-                 max_refine_rounds: int = 1, **kwargs):
+                 micro_batch_size: int = None, **kwargs):
         """
         Initialize the GRPO trainer with optional self-refine capability.
         
@@ -50,8 +46,7 @@ class GRPOTrainer(_GRPOTrainer):
             use_critique: If True, will first generate a critique before refining (two-stage refine)
             refine_log_file: Path to save self-refine logs (default: "self_refine_log.jsonl")
             return_both_responses: If True, return both original and refined responses (doubles sample size)
-            micro_batch_size: If set and using FSDP, split large batches to avoid OOM
-            max_refine_rounds: Number of refinement rounds (default: 1)
+            micro_batch_size: If set and using FSDP2, split large batches to avoid OOM
         """
         super().__init__(*args, **kwargs)
         self.enable_self_refine = enable_self_refine
@@ -59,17 +54,32 @@ class GRPOTrainer(_GRPOTrainer):
         self.refine_log_file = refine_log_file
         self.return_both_responses = return_both_responses
         self.micro_batch_size = micro_batch_size
-        self.max_refine_rounds = max_refine_rounds
-        
-        # Create sampler (unified generation interface)
-        from sampler import create_sampler
-        self.sampler = create_sampler(self, sampler_type="vllm")
-        
-        # Create self-refine agent if enabled
-        if self.enable_self_refine:
-            self.refine_agent = SelfRefineAgent(self, max_refine_rounds=max_refine_rounds)
-            print(f"✅ Self-refine enabled with {max_refine_rounds} round(s), use_critique={use_critique}")
         self.batch_counter = 0
+        
+    def _log_refine_sample(self, sample_data: dict):
+        """
+        Log a single self-refine sample to file in JSONL format.
+        Only saves on main process to avoid duplicate logs.
+        
+        Args:
+            sample_data: Dictionary containing sample information
+        """
+        if not self.accelerator.is_main_process:
+            return
+        
+        import json
+        from pathlib import Path
+        
+        try:
+            # Create log directory if needed
+            log_path = Path(self.refine_log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Append to JSONL file
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(sample_data, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"[Warning] Failed to write to log file: {e}")
     
     def _extract_answer_for_critique(self, text: str) -> str:
         """
@@ -182,8 +192,8 @@ class GRPOTrainer(_GRPOTrainer):
         modify the prompts to include the first attempt and ask for refinement,
         then regenerate for the ENTIRE batch.
         """
-        # First, generate completions using sampler
-        result = self.sampler.generate_and_score(inputs)
+        # First, generate completions normally
+        result = super()._generate_and_score_completions(inputs)
         
         # If self-refine is not enabled, return the result as-is
         if not self.enable_self_refine:
@@ -220,36 +230,330 @@ class GRPOTrainer(_GRPOTrainer):
             else:
                 needs_refine_mask.append(False)
         
-        # If some samples need refinement, call agent (ONE CALL - agent does everything)
+        # If some samples need refinement, regenerate the ENTIRE batch with modified prompts
         if refine_indices:
+            # Store batch size (current batch only, not cumulative!)
+            current_batch_size = len(completions_text)
             self.batch_counter += 1
             
-            # ⭐ ULTIMATE UNIFIED INTERFACE ⭐
-            # Single call - agent handles EVERYTHING:
-            # - Critique generation
-            # - Refine prompt building
-            # - Regeneration
-            # - Evaluation
-            # - Logging
-            correctness_tensor = torch.tensor(correctness_at_t1, device=device)
-            refined_result = self.refine_agent.refine_batch(
-                inputs=inputs,
-                original_result=result,
-                original_prompts=prompts,
-                answers=completions_text,
-                solutions=solutions,
-                correctness_mask=correctness_tensor,
-                batch_counter=self.batch_counter
-            )
+            if self.accelerator.is_main_process:
+                # Calculate batch-level accuracy at t1
+                batch_correct_t1 = sum(correctness_at_t1)
+                batch_acc_t1 = 100 * batch_correct_t1 / current_batch_size
+                
+                print(f"\n{'='*70}")
+                print(f"[Self-Refine] Batch {self.batch_counter} Statistics")
+                print(f"{'='*70}")
+                print(f"Batch size: {current_batch_size}")
+                print(f"Batch Accuracy@t1: {batch_correct_t1}/{current_batch_size} = {batch_acc_t1:.2f}%")
+                print(f"Samples needing refine: {len(refine_indices)}")
+                print(f"Log file: {self.refine_log_file}")
+                print(f"{'-'*70}")
             
-            if refined_result is None:
-                # No incorrect samples (shouldn't happen due to earlier check, but defensive)
-                return result
+            critiques_text = None
+            
+            # Stage 1: Generate critiques if enabled
+            if self.use_critique:
+                if self.accelerator.is_main_process:
+                    print(f"[Self-Refine] Stage 1: Generating critiques...")
+                
+                # Create critique prompts for incorrect samples
+                critique_inputs = []
+                for idx, inp in enumerate(inputs):
+                    if needs_refine_mask[idx]:
+                        # Generate critique for this sample
+                        original_prompt = prompts[idx]
+                        original_completion = completions_text[idx]
+                        # Remove <think> tags - only show final answer for critique
+                        completion_for_critique = self._remove_think_tags(original_completion)
+                        
+                        # Create critique prompt
+                        if is_conversational(inp):
+                            if isinstance(original_prompt, list):
+                                critique_prompt = []
+                                for i, msg in enumerate(original_prompt):
+                                    critique_msg = msg.copy()
+                                    
+                                    # Replace system prompt for critique agent
+                                    if msg["role"] == "system":
+                                        critique_msg["content"] = (
+                                            "You are an expert evaluator. Your task is to:\n"
+                                            "1. Analyze the given solution carefully\n"
+                                            "2. Identify any errors in reasoning or calculation\n"
+                                            "3. Point out what's correct and what needs improvement\n"
+                                            "4. Be specific and constructive in your feedback"
+                                        )
+                                    
+                                    is_last_user_msg = (
+                                        msg["role"] == "user" and
+                                        all(m["role"] != "user" for m in original_prompt[i+1:])
+                                    )
+                                    
+                                    if is_last_user_msg:
+                                        original_content = msg["content"]
+                                        
+                                        # Critique instruction - ask evaluator to review the solution
+                                        # completion_for_critique now contains "Self-review:\n...\n\nSolution:\n..."
+                                        critique_instruction = (
+                                            f"\n\nHere is a student's attempt:\n\n"
+                                            f"{completion_for_critique}\n\n"
+                                            f"Please evaluate this solution:\n"
+                                            f"- Is the self-review accurate?\n"
+                                            f"- Are the reasoning steps correct?\n"
+                                            f"- Are calculations accurate?\n"
+                                            f"- Is the final answer correct?\n\n"
+                                            f"Provide your analysis and point out any errors or issues you find."
+                                        )
+                                        
+                                        if isinstance(original_content, str):
+                                            critique_msg["content"] = f"{original_content}{critique_instruction}"
+                                        elif isinstance(original_content, list):
+                                            critique_msg["content"] = original_content.copy()
+                                            critique_msg["content"].append({
+                                                "type": "text",
+                                                "text": critique_instruction
+                                            })
+                                    
+                                    critique_prompt.append(critique_msg)
+                            else:
+                                critique_prompt = original_prompt
+                        else:
+                            critique_prompt = (
+                                f"{original_prompt}\n\n"
+                                f"{completion_for_critique}\n\n"
+                                f"Evaluate the above. Check the self-review accuracy, verify calculations, "
+                                f"and confirm the answer in \\boxed{{}}. Point out errors or issues."
+                            )
+                        
+                        critique_input = inp.copy()
+                        critique_input["prompt"] = critique_prompt
+                        critique_inputs.append(critique_input)
+                    else:
+                        # Correct samples don't need critique
+                        critique_inputs.append(inp)
+                
+                # Generate critiques
+                critique_result = super()._generate_and_score_completions(critique_inputs)
+                critiques_text_raw = self.processing_class.batch_decode(
+                    critique_result["completion_ids"], 
+                    skip_special_tokens=True
+                )
+                
+                # Normalize critique output - convert <thinking> to <think> tags
+                critiques_text = [self._clean_critique_output(c) for c in critiques_text_raw]
+                
+                if self.accelerator.is_main_process:
+                    print(f"[Self-Refine] Stage 1 complete. Example:")
+                    example_idx = refine_indices[0]
+                    print(f"  Answer: {self._remove_think_tags(completions_text[example_idx])[:150]}...")
+                    print(f"  Critique: {critiques_text[example_idx][:150]}...")
+            
+            # Stage 2: Refine based on critique (or directly if no critique)
+            if self.accelerator.is_main_process:
+                stage_name = "Stage 2: Refining based on critique..." if self.use_critique else "Refining directly..."
+                print(f"[Self-Refine] {stage_name}")
+            
+            # Create refine inputs
+            refine_inputs = []
+            for idx, inp in enumerate(inputs):
+                if needs_refine_mask[idx]:
+                    # This sample needs refine - modify its prompt
+                    original_prompt = prompts[idx]
+                    original_completion = completions_text[idx]
+                    # Remove <think> tags - only show final answer for refine
+                    completion_for_refine = self._remove_think_tags(original_completion)
+                    critique = critiques_text[idx] if critiques_text else None
+                    
+                    # Create refine prompt
+                    if is_conversational(inp):
+                        if isinstance(original_prompt, list):
+                            refine_prompt = []
+                            for i, msg in enumerate(original_prompt):
+                                refine_msg = msg.copy()
+                                
+                                is_last_user_msg = (
+                                    msg["role"] == "user" and
+                                    all(m["role"] != "user" for m in original_prompt[i+1:])
+                                )
+                                
+                                if is_last_user_msg:
+                                    original_content = msg["content"]
+                                    
+                                    if self.use_critique and critique:
+                                        # Natural format: provide original answer as reference + critique as guidance
+                                        # Frame it as collaborative refinement
+                                        refine_instruction = (
+                                            f"\n\nA reference solution:\n{completion_for_refine}\n\n"
+                                            f"Key observations: {critique}\n\n"
+                                            f"Now provide your solution to this problem."
+                                        )
+                                    else:
+                                        # Without critique, show attempt and ask to refine
+                                        refine_instruction = (
+                                            f"\n\nAn initial attempt:\n{completion_for_refine}\n\n"
+                                            f"Verify and refine this solution."
+                                        )
+                                    
+                                    if isinstance(original_content, str):
+                                        refine_msg["content"] = f"{original_content}{refine_instruction}"
+                                    elif isinstance(original_content, list):
+                                        refine_msg["content"] = original_content.copy()
+                                        refine_msg["content"].append({
+                                            "type": "text",
+                                            "text": refine_instruction
+                                        })
+                                
+                                refine_prompt.append(refine_msg)
+                        else:
+                            refine_prompt = original_prompt
+                    else:
+                        if self.use_critique and critique:
+                            refine_prompt = (
+                                f"{original_prompt}\n\n"
+                                f"A reference solution:\n{completion_for_refine}\n\n"
+                                f"Key observations: {critique}\n\n"
+                                f"Provide your solution."
+                            )
+                        else:
+                            refine_prompt = (
+                                f"{original_prompt}\n\n"
+                                f"An initial attempt:\n{completion_for_refine}\n\n"
+                                f"Verify and refine."
+                            )
+                    
+                    refine_input = inp.copy()
+                    refine_input["prompt"] = refine_prompt
+                    refine_inputs.append(refine_input)
+                else:
+                    # This sample is already correct, keep original prompt
+                    refine_inputs.append(inp)
+            
+            # Regenerate for the ENTIRE batch with the modified inputs
+            refined_result = super()._generate_and_score_completions(refine_inputs)
+            
+            # Check correctness at t2 (after refine) and update statistics
+            if self.accelerator.is_main_process:
+                refined_completions = self.processing_class.batch_decode(
+                    refined_result["completion_ids"], 
+                    skip_special_tokens=True
+                )
+                
+                # Calculate batch-level statistics
+                batch_correctness_t2 = []
+                batch_transitions = {"i→c": 0, "i→i": 0, "c→c": 0, "c→i": 0}
+                
+                # Track transitions for all samples in this batch
+                for idx in range(len(completions_text)):
+                    was_correct_at_t1 = correctness_at_t1[idx]
+                    is_correct_at_t2 = self._check_if_correct(refined_completions[idx], solutions[idx])
+                    batch_correctness_t2.append(is_correct_at_t2)
+                    
+                    # Update batch transition counters
+                    if not was_correct_at_t1 and is_correct_at_t2:
+                        batch_transitions["i→c"] += 1
+                    elif not was_correct_at_t1 and not is_correct_at_t2:
+                        batch_transitions["i→i"] += 1
+                    elif was_correct_at_t1 and is_correct_at_t2:
+                        batch_transitions["c→c"] += 1
+                    elif was_correct_at_t1 and not is_correct_at_t2:
+                        batch_transitions["c→i"] += 1
+                
+                # Calculate batch accuracy at t2 (current batch only, not cumulative!)
+                batch_correct_t2 = sum(batch_correctness_t2)
+                batch_acc_t2 = 100 * batch_correct_t2 / current_batch_size
+                batch_delta = batch_acc_t2 - batch_acc_t1
+                
+                # Print batch-level results (current batch only)
+                print(f"[Self-Refine] {'Stage 2 complete!' if self.use_critique else 'Refine complete!'}")
+                print(f"\n📊 Current Batch Results (n={current_batch_size}):")
+                print(f"  Accuracy@t1: {batch_correct_t1}/{current_batch_size} = {batch_acc_t1:.2f}%")
+                print(f"  Accuracy@t2: {batch_correct_t2}/{current_batch_size} = {batch_acc_t2:.2f}%")
+                print(f"  Δ(batch):    {batch_delta:+.2f}% {'📈' if batch_delta > 0 else '📉' if batch_delta < 0 else '➡️'}")
+                print(f"\nBatch Transitions:")
+                print(f"  i→c: {batch_transitions['i→c']:2d}  |  i→i: {batch_transitions['i→i']:2d}")
+                print(f"  c→c: {batch_transitions['c→c']:2d}  |  c→i: {batch_transitions['c→i']:2d}")
+                print(f"{'='*70}")
+                
+                # Show example trace (without <think> tags for clarity)
+                if refine_indices:
+                    print(f"\n[Self-Refine] Example trace:")
+                    example_idx = refine_indices[0]
+                    
+                    # Show cleaned versions (without <think> tags)
+                    original_clean = self._remove_think_tags(completions_text[example_idx])
+                    refined_clean = self._remove_think_tags(refined_completions[example_idx])
+                    
+                    print(f"  Original answer: {original_clean[:150]}...")
+                    if self.use_critique and critiques_text:
+                        print(f"  Critique: {critiques_text[example_idx][:150]}...")
+                    print(f"  Refined answer: {refined_clean[:150]}...")
+                    is_correct_now = self._check_if_correct(refined_completions[example_idx], solutions[example_idx])
+                    print(f"  Result: {'✓ Correct' if is_correct_now else '✗ Still incorrect'}")
+                
+                # Log all samples to file
+                import time
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                for idx in range(len(completions_text)):
+                    log_entry = {
+                        "batch": self.batch_counter,
+                        "sample_idx": idx,
+                        "timestamp": timestamp,
+                        "was_correct_at_t1": correctness_at_t1[idx],
+                        "is_correct_at_t2": batch_correctness_t2[idx],
+                        "transition": None,
+                        "original_answer_full": completions_text[idx],
+                        "original_answer_clean": self._remove_think_tags(completions_text[idx]),
+                        "solution": solutions[idx],
+                    }
+                    
+                    # Determine transition
+                    if not correctness_at_t1[idx] and batch_correctness_t2[idx]:
+                        log_entry["transition"] = "i→c"
+                    elif not correctness_at_t1[idx] and not batch_correctness_t2[idx]:
+                        log_entry["transition"] = "i→i"
+                    elif correctness_at_t1[idx] and batch_correctness_t2[idx]:
+                        log_entry["transition"] = "c→c"
+                    else:
+                        log_entry["transition"] = "c→i"
+                    
+                    # Add critique if available
+                    if self.use_critique and critiques_text:
+                        log_entry["critique"] = critiques_text[idx]
+                    
+                    # Add refined answer
+                    log_entry["refined_answer_full"] = refined_completions[idx]
+                    log_entry["refined_answer_clean"] = self._remove_think_tags(refined_completions[idx])
+                    
+                    # Save to log
+                    self._log_refine_sample(log_entry)
+                
+                if self.accelerator.is_main_process:
+                    print(f"✓ Logged {len(completions_text)} samples to {self.refine_log_file}")
             
             # Return both original and refined results if enabled
             if self.return_both_responses:
+                if self.accelerator.is_main_process:
+                    print(f"\n[Self-Refine] Returning BOTH original and refined responses")
+                    print(f"  Original batch size: {current_batch_size}")
+                    
+                    # # DEBUG: Print all keys in both results
+                    # print(f"\n[DEBUG] Result keys:")
+                    # print(f"  Original keys: {list(result.keys())}")
+                    # print(f"  Refined keys: {list(refined_result.keys())}")
+                    
+                    # # Check shape of each field
+                    # print(f"\n[DEBUG] Field shapes:")
+                    # for key in result.keys():
+                    #     if isinstance(result[key], torch.Tensor):
+                    #         print(f"    {key}: orig={result[key].shape}, refined={refined_result.get(key, 'N/A')}")
+                
                 # Concatenate original and refined results
                 combined_result = self._combine_results(result, refined_result)
+                
+                if self.accelerator.is_main_process:
+                    print(f"  Total samples returned: {combined_result['completion_ids'].shape[0]} (should be {current_batch_size * 2})")
+                
                 return combined_result
             else:
                 # Only return the refined result
