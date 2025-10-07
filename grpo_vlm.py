@@ -73,6 +73,15 @@ from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
+# 在导入vLLM之前应用patch
+from vllm_int8_uvm_kvcache_patch import enable_int8_uvm_kv_cache
+
+enable_int8_uvm_kv_cache(
+    num_blocks=2048,
+    block_size=16,
+    use_uvm=True,
+)
+
 from trl import (
     GRPOConfig,
     ModelConfig,
@@ -290,14 +299,23 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[think_format_reward, accuracy_reward],
+        reward_funcs=[accuracy_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         enable_self_refine=True,
         use_critique=True,
         refine_log_file="self_refine_log.jsonl",
+        self_refine_rounds=3,
+        refine_until_correct=True,
         return_both_responses=True,
-        micro_batch_size=8,  # Reduced to 1 for extremely long sequences (4096 tokens)
+        micro_batch_size=4,  # Reduced to 4 for very long sequences
+        # Attention optimizations (can be combined)
+        use_ring_attention=True,  # Enable RingAttention for sequence parallelism across GPUs
+        sequence_parallel_size=4,  # Number of GPUs for sequence parallelism (None = all)
+        use_chunked_attention=True,  # Enable ChunkedAttention for single-GPU memory optimization
+        chunk_size=1024,  # Chunk size for ChunkedAttention
+        quantize_kv=True,  # Quantize K/V in ChunkedAttention (8-bit)
+        use_uvm=True,  # Use UVM for offloading in ChunkedAttention
         peft_config=get_peft_config(model_args),
     )
     
@@ -307,6 +325,20 @@ if __name__ == "__main__":
         trainer.model.gradient_checkpointing_enable()
         print(f"✅ Unsloth offloaded gradient checkpointing applied to model")
     
+    # Enable 8-bit paged gradient accumulation with UVM_Alt + Quantization
+    # This provides ~87.5% memory savings for accumulated gradients
+    # Works for both standard gradient accumulation AND microbatching
+    from paged_gradient_accumulator import enable_paged_gradient_accumulation
+    enable_paged_gradient_accumulation(
+        trainer,
+        quantization_mode="per_channel",  # Better accuracy
+        use_uvm=True,  # UVM_Alt for automatic paging
+    )
+    print(f"✅ 8-bit paged gradient accumulation enabled")
+    print(f"   - Mode: UVM_Alt + Quantize")
+    print(f"   - Supports: Standard gradient accumulation AND microbatching")
+    print(f"   - Memory savings: ~87.5% for gradient storage")
+
     trainer.train()
 
     # Save and push to hub

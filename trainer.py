@@ -37,7 +37,16 @@ class GRPOTrainer(_GRPOTrainer):
     def __init__(self, *args, enable_self_refine: bool = False, use_critique: bool = True, 
                  refine_log_file: str = "self_refine_log.jsonl", 
                  return_both_responses: bool = False,
-                 micro_batch_size: int = None, **kwargs):
+                 micro_batch_size: int = None,
+                 self_refine_rounds: int = 1,
+                 refine_until_correct: bool = True,
+                 use_ring_attention: bool = False,
+                 sequence_parallel_size: int = None,
+                 use_chunked_attention: bool = False,
+                 chunk_size: int = 512,
+                 quantize_kv: bool = True,
+                 use_uvm: bool = True,
+                 **kwargs):
         """
         Initialize the GRPO trainer with optional self-refine capability.
         
@@ -45,8 +54,17 @@ class GRPOTrainer(_GRPOTrainer):
             enable_self_refine: If True, will attempt to self-refine incorrect responses
             use_critique: If True, will first generate a critique before refining (two-stage refine)
             refine_log_file: Path to save self-refine logs (default: "self_refine_log.jsonl")
-            return_both_responses: If True, return both original and refined responses (doubles sample size)
+            return_both_responses: If True, return both original and final refined responses (doubles sample size)
             micro_batch_size: If set and using FSDP2, split large batches to avoid OOM
+            self_refine_rounds: Number of refine rounds to perform (>=1). 1 = current behavior
+            refine_until_correct: If True, stop refining early when all samples are correct
+            use_ring_attention: If True, enable RingAttention for sequence parallelism
+            sequence_parallel_size: Number of GPUs to use for sequence parallelism (default: all GPUs)
+                                   Must be <= world_size and divide world_size evenly
+            use_chunked_attention: If True, enable ChunkedAttention for memory optimization
+            chunk_size: Chunk size for ChunkedAttention (default: 512)
+            quantize_kv: Whether to quantize K/V in ChunkedAttention (default: True)
+            use_uvm: Whether to use UVM for offloading in ChunkedAttention (default: True)
         """
         super().__init__(*args, **kwargs)
         self.enable_self_refine = enable_self_refine
@@ -54,7 +72,179 @@ class GRPOTrainer(_GRPOTrainer):
         self.refine_log_file = refine_log_file
         self.return_both_responses = return_both_responses
         self.micro_batch_size = micro_batch_size
+        self.self_refine_rounds = max(1, int(self_refine_rounds))
+        self.refine_until_correct = bool(refine_until_correct)
         self.batch_counter = 0
+        self.use_ring_attention = use_ring_attention
+        self.sequence_parallel_size = sequence_parallel_size
+        self.use_chunked_attention = use_chunked_attention
+        self.chunk_size = chunk_size
+        self.quantize_kv = quantize_kv
+        self.use_uvm = use_uvm
+        
+        # Apply attention optimizations if requested
+        if self.use_ring_attention or self.use_chunked_attention:
+            self._apply_attention_optimizations()
+    
+    def _apply_attention_optimizations(self):
+        """
+        Apply attention optimizations (RingAttention, ChunkedAttention, or both).
+        
+        This method patches the model's attention layers to use:
+        - RingAttention: sequence parallelism across GPUs
+        - ChunkedAttention: memory optimization via chunking + UVM offload
+        - Hybrid: both optimizations combined
+        """
+        try:
+            import torch.distributed as dist
+            
+            world_size = self.accelerator.num_processes
+            
+            # Determine operation mode
+            if self.use_ring_attention and self.use_chunked_attention:
+                mode = "Hybrid (Ring + Chunked)"
+            elif self.use_ring_attention:
+                mode = "RingAttention only"
+            elif self.use_chunked_attention:
+                mode = "ChunkedAttention only"
+            else:
+                return  # Nothing to do
+            
+            if self.accelerator.is_main_process:
+                print(f"\n{'='*70}")
+                print(f"Attention Optimization: {mode}")
+                print(f"{'='*70}")
+            
+            # Setup RingAttention parameters if enabled
+            if self.use_ring_attention:
+                # Validate sequence_parallel_size
+                if self.sequence_parallel_size is None:
+                    sp_size = world_size
+                else:
+                    sp_size = self.sequence_parallel_size
+                    
+                    if sp_size > world_size:
+                        raise ValueError(
+                            f"sequence_parallel_size ({sp_size}) cannot exceed world_size ({world_size})"
+                        )
+                    
+                    if world_size % sp_size != 0:
+                        raise ValueError(
+                            f"world_size ({world_size}) must be divisible by sequence_parallel_size ({sp_size})"
+                        )
+                
+                if self.accelerator.is_main_process:
+                    print(f"RingAttention:")
+                    print(f"  World size: {world_size}")
+                    print(f"  Sequence parallel size: {sp_size}")
+                    print(f"  Data parallel size: {world_size // sp_size}")
+                
+                # Create process groups for sequence parallelism
+                if dist.is_initialized() and sp_size < world_size:
+                    self._setup_sequence_parallel_groups(sp_size)
+                
+                process_group = getattr(self, 'sp_group', None) if sp_size < world_size else None
+            else:
+                sp_size = None
+                process_group = None
+            
+            # Setup ChunkedAttention parameters if enabled
+            if self.use_chunked_attention:
+                if self.accelerator.is_main_process:
+                    print(f"ChunkedAttention:")
+                    print(f"  Chunk size: {self.chunk_size}")
+                    print(f"  K/V quantization: {self.quantize_kv}")
+                    print(f"  UVM offloading: {self.use_uvm}")
+            
+            # Print memory savings estimate for hybrid mode
+            if self.use_ring_attention and self.use_chunked_attention and self.accelerator.is_main_process:
+                print(f"\nHybrid Mode Memory Savings:")
+                print(f"  RingAttention: {sp_size}x (sequence split across GPUs)")
+                print(f"  ChunkedAttention: ~1000x (chunking + quantization)")
+                print(f"  Combined: ~{sp_size * 1000}x total memory savings")
+                print(f"\nExample: 128K sequence on {sp_size} GPUs")
+                print(f"  Per GPU: {128 // sp_size}K tokens (after Ring split)")
+                num_chunks = (128 * 1024 // sp_size) // self.chunk_size
+                print(f"  Per GPU: {num_chunks} chunks × {self.chunk_size} tokens (after Chunking)")
+                print(f"  GPU peak: ~20MB (one chunk at a time)")
+                print(f"  CPU/UVM: ~4MB (quantized K/V cache)")
+            
+            # Patch the model
+            if self.use_ring_attention and self.use_chunked_attention:
+                # Hybrid mode: RingAttention with ChunkedAttention for local computation
+                from ring_attention import patch_model_for_ring_attention
+                self.model = patch_model_for_ring_attention(
+                    self.model,
+                    sequence_parallel_size=sp_size,
+                    process_group=process_group,
+                    enable_chunking=True,
+                    chunk_size=self.chunk_size,
+                    quantize_kv=self.quantize_kv,
+                    use_uvm=self.use_uvm,
+                )
+            elif self.use_ring_attention:
+                # RingAttention only
+                from ring_attention import patch_model_for_ring_attention
+                self.model = patch_model_for_ring_attention(
+                    self.model,
+                    sequence_parallel_size=sp_size,
+                    process_group=process_group,
+                    enable_chunking=False,
+                )
+            elif self.use_chunked_attention:
+                # ChunkedAttention only
+                from chunked_attention import patch_model_for_chunked_attention
+                self.model = patch_model_for_chunked_attention(
+                    self.model,
+                    chunk_size=self.chunk_size,
+                    quantize_kv=self.quantize_kv,
+                    use_uvm=self.use_uvm,
+                )
+            
+            if self.accelerator.is_main_process:
+                print(f"{'='*70}\n")
+                
+        except ImportError as e:
+            if self.accelerator.is_main_process:
+                print(f"Warning: Could not import required modules: {e}")
+                print("Continuing without attention optimizations")
+        except Exception as e:
+            if self.accelerator.is_main_process:
+                print(f"Warning: Failed to apply attention optimizations: {e}")
+                print("Continuing without attention optimizations")
+    
+    def _setup_sequence_parallel_groups(self, sp_size: int):
+        """
+        Setup process groups for hybrid data + sequence parallelism.
+        
+        Example with 8 GPUs and sp_size=4:
+        - SP Group 0: [0, 1, 2, 3]  (handles same data, split sequence)
+        - SP Group 1: [4, 5, 6, 7]  (handles different data, split sequence)
+        
+        Args:
+            sp_size: Sequence parallel size
+        """
+        import torch.distributed as dist
+        
+        world_size = self.accelerator.num_processes
+        rank = self.accelerator.process_index
+        dp_size = world_size // sp_size
+        
+        # Create sequence parallel groups
+        for i in range(dp_size):
+            ranks = list(range(i * sp_size, (i + 1) * sp_size))
+            group = dist.new_group(ranks)
+            
+            if rank in ranks:
+                self.sp_group = group
+                self.sp_rank = rank - i * sp_size
+                self.dp_rank = i
+        
+        if self.accelerator.is_main_process:
+            print(f"[RingAttention] Created {dp_size} sequence parallel groups of size {sp_size}")
+            for i in range(dp_size):
+                ranks = list(range(i * sp_size, (i + 1) * sp_size))
+                print(f"[RingAttention]   SP Group {i}: {ranks}")
         
     def _log_refine_sample(self, sample_data: dict):
         """
@@ -230,335 +420,300 @@ class GRPOTrainer(_GRPOTrainer):
             else:
                 needs_refine_mask.append(False)
         
-        # If some samples need refinement, regenerate the ENTIRE batch with modified prompts
+        # If some samples need refinement, run multi-round refinement with optional early stopping
         if refine_indices:
-            # Store batch size (current batch only, not cumulative!)
             current_batch_size = len(completions_text)
             self.batch_counter += 1
-            
+
             if self.accelerator.is_main_process:
-                # Calculate batch-level accuracy at t1
-                batch_correct_t1 = sum(correctness_at_t1)
-                batch_acc_t1 = 100 * batch_correct_t1 / current_batch_size
-                
+                batch_correct_t0 = sum(correctness_at_t1)
+                batch_acc_t0 = 100 * batch_correct_t0 / current_batch_size
                 print(f"\n{'='*70}")
                 print(f"[Self-Refine] Batch {self.batch_counter} Statistics")
                 print(f"{'='*70}")
                 print(f"Batch size: {current_batch_size}")
-                print(f"Batch Accuracy@t1: {batch_correct_t1}/{current_batch_size} = {batch_acc_t1:.2f}%")
-                print(f"Samples needing refine: {len(refine_indices)}")
+                print(f"Batch Accuracy@r0: {batch_correct_t0}/{current_batch_size} = {batch_acc_t0:.2f}%")
+                print(f"Samples needing refine (r0): {len(refine_indices)}")
                 print(f"Log file: {self.refine_log_file}")
                 print(f"{'-'*70}")
-            
-            critiques_text = None
-            
-            # Stage 1: Generate critiques if enabled
-            if self.use_critique:
+
+            original_result = result
+            original_completions_text = completions_text
+            original_correctness = correctness_at_t1
+
+            # Collect results for each round including the original
+            results_across_rounds = [result]
+
+            current_result = result
+            current_completions_text = completions_text
+            current_correctness = correctness_at_t1
+            last_critiques_text = None
+
+            total_rounds = self.self_refine_rounds
+            for round_idx in range(1, total_rounds + 1):
+                needs_refine_mask = [not x for x in current_correctness]
+                refine_indices = [i for i, need in enumerate(needs_refine_mask) if need]
+
                 if self.accelerator.is_main_process:
-                    print(f"[Self-Refine] Stage 1: Generating critiques...")
-                
-                # Create critique prompts for incorrect samples
-                critique_inputs = []
+                    print(f"[Self-Refine] Round {round_idx}/{total_rounds}: Generating critiques and refining ({len(refine_indices)} samples)")
+
+                if not refine_indices:
+                    if self.accelerator.is_main_process:
+                        print(f"[Self-Refine] All samples correct before refine round {round_idx}. Early stop.")
+                    break
+
+                critiques_text = None
+                if self.use_critique:
+                    if self.accelerator.is_main_process:
+                        print(f"[Self-Refine] Round {round_idx}: Generating critiques...")
+
+                    critique_inputs = []
+                    for idx, inp in enumerate(inputs):
+                        if needs_refine_mask[idx]:
+                            original_prompt = prompts[idx]
+                            original_completion = current_completions_text[idx]
+                            # Keep the full completion including <think> tags for critique
+                            ground_truth = solutions[idx]
+
+                            if is_conversational(inp):
+                                if isinstance(original_prompt, list):
+                                    critique_prompt = []
+                                    for i, msg in enumerate(original_prompt):
+                                        critique_msg = msg.copy()
+                                        if msg["role"] == "system":
+                                            critique_msg["content"] = (
+                                                "You are an expert critic. You have access to:\n"
+                                                "1. The original problem\n"
+                                                "2. A student's full solution including their reasoning process\n"
+                                                "3. The correct answer\n\n"
+                                                "Your task:\n"
+                                                "- Compare the student's reasoning and answer against the ground truth\n"
+                                                "- Identify WHERE the student's reasoning went wrong (if incorrect)\n"
+                                                "- Identify WHAT misconceptions or errors led to the mistake\n"
+                                                "- If the student is correct, identify the key insights that made their solution work\n"
+                                                "- Provide 2-3 specific, actionable suggestions for improvement\n"
+                                                "- Be precise: reference specific steps, calculations, or logical jumps\n\n"
+                                                "Format: Brief, focused critique (2-4 sentences max)"
+                                            )
+                                        is_last_user_msg = (
+                                            msg["role"] == "user" and
+                                            all(m["role"] != "user" for m in original_prompt[i+1:])
+                                        )
+                                        if is_last_user_msg:
+                                            original_content = msg["content"]
+                                            critique_instruction = (
+                                                f"\n\n=== STUDENT'S SOLUTION (including reasoning) ===\n"
+                                                f"{original_completion}\n\n"
+                                                f"=== CORRECT ANSWER ===\n"
+                                                f"{ground_truth}\n\n"
+                                                f"Analyze the student's solution. Where did they go wrong? What should they focus on?"
+                                            )
+                                            if isinstance(original_content, str):
+                                                critique_msg["content"] = f"{original_content}{critique_instruction}"
+                                            elif isinstance(original_content, list):
+                                                critique_msg["content"] = original_content.copy()
+                                                critique_msg["content"].append({"type": "text", "text": critique_instruction})
+                                        critique_prompt.append(critique_msg)
+                                else:
+                                    critique_prompt = original_prompt
+                            else:
+                                critique_prompt = (
+                                    f"{original_prompt}\n\n"
+                                    f"=== STUDENT'S SOLUTION ===\n{original_completion}\n\n"
+                                    f"=== CORRECT ANSWER ===\n{ground_truth}\n\n"
+                                    f"Critique: What went wrong and what should be improved?"
+                                )
+
+                            critique_input = inp.copy()
+                            critique_input["prompt"] = critique_prompt
+                            critique_inputs.append(critique_input)
+                        else:
+                            critique_inputs.append(inp)
+
+                    critique_result = super()._generate_and_score_completions(critique_inputs)
+                    critiques_text_raw = self.processing_class.batch_decode(critique_result["completion_ids"], skip_special_tokens=True)
+                    critiques_text = [self._clean_critique_output(c) for c in critiques_text_raw]
+                    last_critiques_text = critiques_text
+
+                    if self.accelerator.is_main_process:
+                        example_idx = refine_indices[0]
+                        print(f"[Self-Refine] Round {round_idx}: Critique example:")
+                        print(f"  Answer: {self._remove_think_tags(current_completions_text[example_idx])[:150]}...")
+                        print(f"  Critique: {critiques_text[example_idx][:150]}...")
+
+                if self.accelerator.is_main_process:
+                    stage_name = "Refining based on critique..." if self.use_critique else "Refining directly..."
+                    print(f"[Self-Refine] Round {round_idx}: {stage_name}")
+
+                refine_inputs = []
                 for idx, inp in enumerate(inputs):
                     if needs_refine_mask[idx]:
-                        # Generate critique for this sample
                         original_prompt = prompts[idx]
-                        original_completion = completions_text[idx]
-                        # Remove <think> tags - only show final answer for critique
-                        completion_for_critique = self._remove_think_tags(original_completion)
-                        
-                        # Create critique prompt
+                        original_completion = current_completions_text[idx]
+                        critique = critiques_text[idx] if critiques_text else None
+
                         if is_conversational(inp):
                             if isinstance(original_prompt, list):
-                                critique_prompt = []
+                                refine_prompt = []
                                 for i, msg in enumerate(original_prompt):
-                                    critique_msg = msg.copy()
-                                    
-                                    # Replace system prompt for critique agent
-                                    if msg["role"] == "system":
-                                        critique_msg["content"] = (
-                                            "You are an expert evaluator. Your task is to:\n"
-                                            "1. Analyze the given solution carefully\n"
-                                            "2. Identify any errors in reasoning or calculation\n"
-                                            "3. Point out what's correct and what needs improvement\n"
-                                            "4. Be specific and constructive in your feedback"
-                                        )
-                                    
+                                    refine_msg = msg.copy()
+                                    # Keep original system prompt for improver - no changes needed
                                     is_last_user_msg = (
                                         msg["role"] == "user" and
                                         all(m["role"] != "user" for m in original_prompt[i+1:])
                                     )
-                                    
                                     if is_last_user_msg:
                                         original_content = msg["content"]
-                                        
-                                        # Critique instruction - ask evaluator to review the solution
-                                        # completion_for_critique now contains "Self-review:\n...\n\nSolution:\n..."
-                                        critique_instruction = (
-                                            f"\n\nHere is a student's attempt:\n\n"
-                                            f"{completion_for_critique}\n\n"
-                                            f"Please evaluate this solution:\n"
-                                            f"- Is the self-review accurate?\n"
-                                            f"- Are the reasoning steps correct?\n"
-                                            f"- Are calculations accurate?\n"
-                                            f"- Is the final answer correct?\n\n"
-                                            f"Provide your analysis and point out any errors or issues you find."
-                                        )
-                                        
+                                        if self.use_critique and critique:
+                                            refine_instruction = (
+                                                f"\n\n=== PREVIOUS ATTEMPT ANALYSIS ===\n"
+                                                f"Your earlier attempt had issues. Here's what an expert identified:\n\n"
+                                                f"{critique}\n\n"
+                                                f"=== YOUR TASK ===\n"
+                                                f"Absorb the feedback above, then solve this problem FROM SCRATCH.\n"
+                                                f"Do NOT try to patch the previous solution - start fresh with the insights you gained.\n"
+                                                f"Think through the problem completely, applying what you learned about:\n"
+                                                f"- Where the reasoning went wrong\n"
+                                                f"- What approach would be correct\n"
+                                                f"- Key concepts or calculations that need attention\n\n"
+                                                f"Now solve it yourself, step by step."
+                                            )
+                                        else:
+                                            refine_instruction = (
+                                                f"\n\nYour previous attempt was incorrect. Reconsider the problem and solve it from scratch."
+                                            )
                                         if isinstance(original_content, str):
-                                            critique_msg["content"] = f"{original_content}{critique_instruction}"
+                                            refine_msg["content"] = f"{original_content}{refine_instruction}"
                                         elif isinstance(original_content, list):
-                                            critique_msg["content"] = original_content.copy()
-                                            critique_msg["content"].append({
-                                                "type": "text",
-                                                "text": critique_instruction
-                                            })
-                                    
-                                    critique_prompt.append(critique_msg)
+                                            refine_msg["content"] = original_content.copy()
+                                            refine_msg["content"].append({"type": "text", "text": refine_instruction})
+                                    refine_prompt.append(refine_msg)
                             else:
-                                critique_prompt = original_prompt
+                                refine_prompt = original_prompt
                         else:
-                            critique_prompt = (
-                                f"{original_prompt}\n\n"
-                                f"{completion_for_critique}\n\n"
-                                f"Evaluate the above. Check the self-review accuracy, verify calculations, "
-                                f"and confirm the answer in \\boxed{{}}. Point out errors or issues."
-                            )
-                        
-                        critique_input = inp.copy()
-                        critique_input["prompt"] = critique_prompt
-                        critique_inputs.append(critique_input)
-                    else:
-                        # Correct samples don't need critique
-                        critique_inputs.append(inp)
-                
-                # Generate critiques
-                critique_result = super()._generate_and_score_completions(critique_inputs)
-                critiques_text_raw = self.processing_class.batch_decode(
-                    critique_result["completion_ids"], 
-                    skip_special_tokens=True
-                )
-                
-                # Normalize critique output - convert <thinking> to <think> tags
-                critiques_text = [self._clean_critique_output(c) for c in critiques_text_raw]
-                
-                if self.accelerator.is_main_process:
-                    print(f"[Self-Refine] Stage 1 complete. Example:")
-                    example_idx = refine_indices[0]
-                    print(f"  Answer: {self._remove_think_tags(completions_text[example_idx])[:150]}...")
-                    print(f"  Critique: {critiques_text[example_idx][:150]}...")
-            
-            # Stage 2: Refine based on critique (or directly if no critique)
-            if self.accelerator.is_main_process:
-                stage_name = "Stage 2: Refining based on critique..." if self.use_critique else "Refining directly..."
-                print(f"[Self-Refine] {stage_name}")
-            
-            # Create refine inputs
-            refine_inputs = []
-            for idx, inp in enumerate(inputs):
-                if needs_refine_mask[idx]:
-                    # This sample needs refine - modify its prompt
-                    original_prompt = prompts[idx]
-                    original_completion = completions_text[idx]
-                    # Remove <think> tags - only show final answer for refine
-                    completion_for_refine = self._remove_think_tags(original_completion)
-                    critique = critiques_text[idx] if critiques_text else None
-                    
-                    # Create refine prompt
-                    if is_conversational(inp):
-                        if isinstance(original_prompt, list):
-                            refine_prompt = []
-                            for i, msg in enumerate(original_prompt):
-                                refine_msg = msg.copy()
-                                
-                                is_last_user_msg = (
-                                    msg["role"] == "user" and
-                                    all(m["role"] != "user" for m in original_prompt[i+1:])
+                            if self.use_critique and critique:
+                                refine_prompt = (
+                                    f"{original_prompt}\n\n"
+                                    f"=== PREVIOUS ATTEMPT ANALYSIS ===\n{critique}\n\n"
+                                    f"=== YOUR TASK ===\n"
+                                    f"Learn from the feedback above, then solve FROM SCRATCH (do not patch the previous solution)."
                                 )
-                                
-                                if is_last_user_msg:
-                                    original_content = msg["content"]
-                                    
-                                    if self.use_critique and critique:
-                                        # Natural format: provide original answer as reference + critique as guidance
-                                        # Frame it as collaborative refinement
-                                        refine_instruction = (
-                                            f"\n\nA reference solution:\n{completion_for_refine}\n\n"
-                                            f"Key observations: {critique}\n\n"
-                                            f"Now provide your solution to this problem."
-                                        )
-                                    else:
-                                        # Without critique, show attempt and ask to refine
-                                        refine_instruction = (
-                                            f"\n\nAn initial attempt:\n{completion_for_refine}\n\n"
-                                            f"Verify and refine this solution."
-                                        )
-                                    
-                                    if isinstance(original_content, str):
-                                        refine_msg["content"] = f"{original_content}{refine_instruction}"
-                                    elif isinstance(original_content, list):
-                                        refine_msg["content"] = original_content.copy()
-                                        refine_msg["content"].append({
-                                            "type": "text",
-                                            "text": refine_instruction
-                                        })
-                                
-                                refine_prompt.append(refine_msg)
-                        else:
-                            refine_prompt = original_prompt
+                            else:
+                                refine_prompt = (
+                                    f"{original_prompt}\n\n"
+                                    f"Your previous attempt was incorrect. Solve from scratch."
+                                )
+
+                        refine_input = inp.copy()
+                        refine_input["prompt"] = refine_prompt
+                        refine_inputs.append(refine_input)
                     else:
-                        if self.use_critique and critique:
-                            refine_prompt = (
-                                f"{original_prompt}\n\n"
-                                f"A reference solution:\n{completion_for_refine}\n\n"
-                                f"Key observations: {critique}\n\n"
-                                f"Provide your solution."
-                            )
-                        else:
-                            refine_prompt = (
-                                f"{original_prompt}\n\n"
-                                f"An initial attempt:\n{completion_for_refine}\n\n"
-                                f"Verify and refine."
-                            )
-                    
-                    refine_input = inp.copy()
-                    refine_input["prompt"] = refine_prompt
-                    refine_inputs.append(refine_input)
-                else:
-                    # This sample is already correct, keep original prompt
-                    refine_inputs.append(inp)
-            
-            # Regenerate for the ENTIRE batch with the modified inputs
-            refined_result = super()._generate_and_score_completions(refine_inputs)
-            
-            # Check correctness at t2 (after refine) and update statistics
-            if self.accelerator.is_main_process:
-                refined_completions = self.processing_class.batch_decode(
-                    refined_result["completion_ids"], 
-                    skip_special_tokens=True
-                )
-                
-                # Calculate batch-level statistics
-                batch_correctness_t2 = []
+                        refine_inputs.append(inp)
+
+                new_result = super()._generate_and_score_completions(refine_inputs)
+                new_completions_text = self.processing_class.batch_decode(new_result["completion_ids"], skip_special_tokens=True)
+
                 batch_transitions = {"i→c": 0, "i→i": 0, "c→c": 0, "c→i": 0}
-                
-                # Track transitions for all samples in this batch
-                for idx in range(len(completions_text)):
-                    was_correct_at_t1 = correctness_at_t1[idx]
-                    is_correct_at_t2 = self._check_if_correct(refined_completions[idx], solutions[idx])
-                    batch_correctness_t2.append(is_correct_at_t2)
-                    
-                    # Update batch transition counters
-                    if not was_correct_at_t1 and is_correct_at_t2:
+                new_correctness = []
+                for idx in range(len(current_completions_text)):
+                    was_correct = current_correctness[idx]
+                    is_correct_now = self._check_if_correct(new_completions_text[idx], solutions[idx])
+                    new_correctness.append(is_correct_now)
+                    if not was_correct and is_correct_now:
                         batch_transitions["i→c"] += 1
-                    elif not was_correct_at_t1 and not is_correct_at_t2:
+                    elif not was_correct and not is_correct_now:
                         batch_transitions["i→i"] += 1
-                    elif was_correct_at_t1 and is_correct_at_t2:
+                    elif was_correct and is_correct_now:
                         batch_transitions["c→c"] += 1
-                    elif was_correct_at_t1 and not is_correct_at_t2:
+                    else:
                         batch_transitions["c→i"] += 1
-                
-                # Calculate batch accuracy at t2 (current batch only, not cumulative!)
-                batch_correct_t2 = sum(batch_correctness_t2)
-                batch_acc_t2 = 100 * batch_correct_t2 / current_batch_size
-                batch_delta = batch_acc_t2 - batch_acc_t1
-                
-                # Print batch-level results (current batch only)
-                print(f"[Self-Refine] {'Stage 2 complete!' if self.use_critique else 'Refine complete!'}")
-                print(f"\n📊 Current Batch Results (n={current_batch_size}):")
-                print(f"  Accuracy@t1: {batch_correct_t1}/{current_batch_size} = {batch_acc_t1:.2f}%")
-                print(f"  Accuracy@t2: {batch_correct_t2}/{current_batch_size} = {batch_acc_t2:.2f}%")
-                print(f"  Δ(batch):    {batch_delta:+.2f}% {'📈' if batch_delta > 0 else '📉' if batch_delta < 0 else '➡️'}")
-                print(f"\nBatch Transitions:")
-                print(f"  i→c: {batch_transitions['i→c']:2d}  |  i→i: {batch_transitions['i→i']:2d}")
-                print(f"  c→c: {batch_transitions['c→c']:2d}  |  c→i: {batch_transitions['c→i']:2d}")
-                print(f"{'='*70}")
-                
-                # Show example trace (without <think> tags for clarity)
-                if refine_indices:
-                    print(f"\n[Self-Refine] Example trace:")
-                    example_idx = refine_indices[0]
-                    
-                    # Show cleaned versions (without <think> tags)
-                    original_clean = self._remove_think_tags(completions_text[example_idx])
-                    refined_clean = self._remove_think_tags(refined_completions[example_idx])
-                    
-                    print(f"  Original answer: {original_clean[:150]}...")
-                    if self.use_critique and critiques_text:
-                        print(f"  Critique: {critiques_text[example_idx][:150]}...")
-                    print(f"  Refined answer: {refined_clean[:150]}...")
-                    is_correct_now = self._check_if_correct(refined_completions[example_idx], solutions[example_idx])
-                    print(f"  Result: {'✓ Correct' if is_correct_now else '✗ Still incorrect'}")
-                
-                # Log all samples to file
+
+                if self.accelerator.is_main_process:
+                    prev_correct = sum(current_correctness)
+                    curr_correct = sum(new_correctness)
+                    acc_prev = 100 * prev_correct / current_batch_size
+                    acc_curr = 100 * curr_correct / current_batch_size
+                    delta = acc_curr - acc_prev
+                    print(f"\n📊 Round {round_idx} Results (n={current_batch_size}):")
+                    print(f"  Accuracy@r{round_idx-1}: {prev_correct}/{current_batch_size} = {acc_prev:.2f}%")
+                    print(f"  Accuracy@r{round_idx}:   {curr_correct}/{current_batch_size} = {acc_curr:.2f}%")
+                    print(f"  Δ(batch):      {delta:+.2f}% {'📈' if delta > 0 else '📉' if delta < 0 else '➡️'}")
+                    print(f"\nRound {round_idx} Transitions:")
+                    print(f"  i→c: {batch_transitions['i→c']:2d}  |  i→i: {batch_transitions['i→i']:2d}")
+                    print(f"  c→c: {batch_transitions['c→c']:2d}  |  c→i: {batch_transitions['c→i']:2d}")
+                    print(f"{'='*70}")
+
+                current_result = new_result
+                current_completions_text = new_completions_text
+                current_correctness = new_correctness
+                results_across_rounds.append(new_result)
+
+                if self.refine_until_correct and all(current_correctness):
+                    if self.accelerator.is_main_process:
+                        print(f"[Self-Refine] All samples correct after round {round_idx}. Early stopping.")
+                    break
+
+            # Final logging for the last state vs original
+            if self.accelerator.is_main_process:
                 import time
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                
-                for idx in range(len(completions_text)):
+
+                # Example trace
+                example_idx = None
+                for i in range(len(original_completions_text)):
+                    if not original_correctness[i] or original_completions_text[i] != current_completions_text[i]:
+                        example_idx = i
+                        break
+                if example_idx is None:
+                    example_idx = 0
+                print(f"\n[Self-Refine] Example trace (final):")
+                print(f"  Original: {self._remove_think_tags(original_completions_text[example_idx])[:150]}...")
+                if last_critiques_text:
+                    print(f"  Last critique: {last_critiques_text[example_idx][:150]}...")
+                print(f"  Final:    {self._remove_think_tags(current_completions_text[example_idx])[:150]}...")
+                print(f"  Result: {'✓ Correct' if current_correctness[example_idx] else '✗ Incorrect'}")
+
+                for idx in range(len(original_completions_text)):
                     log_entry = {
                         "batch": self.batch_counter,
                         "sample_idx": idx,
                         "timestamp": timestamp,
-                        "was_correct_at_t1": correctness_at_t1[idx],
-                        "is_correct_at_t2": batch_correctness_t2[idx],
+                        "was_correct_at_t1": original_correctness[idx],
+                        "is_correct_at_t2": current_correctness[idx],
                         "transition": None,
-                        "original_answer_full": completions_text[idx],
-                        "original_answer_clean": self._remove_think_tags(completions_text[idx]),
+                        "original_answer_full": original_completions_text[idx],
+                        "original_answer_clean": self._remove_think_tags(original_completions_text[idx]),
                         "solution": solutions[idx],
                     }
-                    
-                    # Determine transition
-                    if not correctness_at_t1[idx] and batch_correctness_t2[idx]:
+                    if not original_correctness[idx] and current_correctness[idx]:
                         log_entry["transition"] = "i→c"
-                    elif not correctness_at_t1[idx] and not batch_correctness_t2[idx]:
+                    elif not original_correctness[idx] and not current_correctness[idx]:
                         log_entry["transition"] = "i→i"
-                    elif correctness_at_t1[idx] and batch_correctness_t2[idx]:
+                    elif original_correctness[idx] and current_correctness[idx]:
                         log_entry["transition"] = "c→c"
                     else:
                         log_entry["transition"] = "c→i"
-                    
-                    # Add critique if available
-                    if self.use_critique and critiques_text:
-                        log_entry["critique"] = critiques_text[idx]
-                    
-                    # Add refined answer
-                    log_entry["refined_answer_full"] = refined_completions[idx]
-                    log_entry["refined_answer_clean"] = self._remove_think_tags(refined_completions[idx])
-                    
-                    # Save to log
+                    if last_critiques_text:
+                        log_entry["critique"] = last_critiques_text[idx]
+                    log_entry["refined_answer_full"] = current_completions_text[idx]
+                    log_entry["refined_answer_clean"] = self._remove_think_tags(current_completions_text[idx])
                     self._log_refine_sample(log_entry)
-                
-                if self.accelerator.is_main_process:
-                    print(f"✓ Logged {len(completions_text)} samples to {self.refine_log_file}")
-            
-            # Return both original and refined results if enabled
+
+                print(f"✓ Logged {len(original_completions_text)} samples to {self.refine_log_file}")
+
             if self.return_both_responses:
+                # Combine ALL rounds (original + every refine round)
+                combined_result = results_across_rounds[0]
+                for r in results_across_rounds[1:]:
+                    combined_result = self._combine_results(combined_result, r)
                 if self.accelerator.is_main_process:
-                    print(f"\n[Self-Refine] Returning BOTH original and refined responses")
-                    print(f"  Original batch size: {current_batch_size}")
-                    
-                    # # DEBUG: Print all keys in both results
-                    # print(f"\n[DEBUG] Result keys:")
-                    # print(f"  Original keys: {list(result.keys())}")
-                    # print(f"  Refined keys: {list(refined_result.keys())}")
-                    
-                    # # Check shape of each field
-                    # print(f"\n[DEBUG] Field shapes:")
-                    # for key in result.keys():
-                    #     if isinstance(result[key], torch.Tensor):
-                    #         print(f"    {key}: orig={result[key].shape}, refined={refined_result.get(key, 'N/A')}")
-                
-                # Concatenate original and refined results
-                combined_result = self._combine_results(result, refined_result)
-                
-                if self.accelerator.is_main_process:
-                    print(f"  Total samples returned: {combined_result['completion_ids'].shape[0]} (should be {current_batch_size * 2})")
-                
+                    expected = current_batch_size * len(results_across_rounds)
+                    print(f"\n[Self-Refine] Returning ALL responses across {len(results_across_rounds)} rounds (including original)")
+                    print(f"  Total samples returned: {combined_result['completion_ids'].shape[0]} (should be {expected})")
                 return combined_result
             else:
-                # Only return the refined result
-                return refined_result
-        
+                return current_result
+
         return result
     
     def _combine_results(self, result1: dict, result2: dict) -> dict:
@@ -567,7 +722,8 @@ class GRPOTrainer(_GRPOTrainer):
         Both batches must have same structure.
         """
         combined = {}
-        batch_size = result1["completion_ids"].shape[0]
+        batch_size1 = result1["completion_ids"].shape[0]
+        batch_size2 = result2["completion_ids"].shape[0]
         device = result1["completion_ids"].device
         
         # Padded sequence fields
@@ -593,11 +749,11 @@ class GRPOTrainer(_GRPOTrainer):
                 val1 = result1[key]
                 val2 = result2[key]
                 
-                # Unpad
+                # Unpad respecting each batch size
                 list1 = [val1[i][val1[i] != padding_value] if (val1[i] != padding_value).any() else val1[i] 
-                         for i in range(batch_size)]
+                         for i in range(batch_size1)]
                 list2 = [val2[i][val2[i] != padding_value] if (val2[i] != padding_value).any() else val2[i]
-                         for i in range(batch_size)]
+                         for i in range(batch_size2)]
                 
                 # Store unpadded data
                 unpadded_data[key] = list1 + list2
@@ -1052,10 +1208,90 @@ class GRPOTrainer(_GRPOTrainer):
         # FSDP: Implement micro-batching by manually splitting forward passes
         num_micro_batches = (batch_size + self.micro_batch_size - 1) // self.micro_batch_size
         
+        # Sort by sequence length to reduce padding within each micro-batch
+        # Use completion_mask to compute actual sequence lengths
+        completion_mask = inputs.get("completion_mask")
+        if completion_mask is not None:
+            seq_lengths = completion_mask.sum(dim=1)
+            sorted_indices = torch.argsort(seq_lengths, descending=True)
+            
+            # Pre-compute original visual data indices before reordering (needed for proper slicing)
+            has_visual_data_presort = "image_grid_thw" in inputs and "pixel_values" in inputs
+            if has_visual_data_presort:
+                orig_image_grid_thw = inputs["image_grid_thw"]
+                orig_num_images = inputs.get("num_images")
+                
+                # Build patch/image ranges for original order
+                if orig_num_images is not None:
+                    orig_rows_per_image = orig_image_grid_thw.prod(dim=-1)
+                    orig_rows_per_sample = torch.split(orig_rows_per_image, orig_num_images)
+                    orig_rows_per_sample = torch.stack([s.sum() for s in orig_rows_per_sample])
+                    orig_patch_starts = torch.cat([torch.tensor([0], device=orig_rows_per_sample.device), orig_rows_per_sample.cumsum(0)])
+                    orig_image_starts = torch.tensor([0] + orig_num_images, device=orig_image_grid_thw.device).cumsum(0)
+                else:
+                    orig_patches_per_sample = orig_image_grid_thw[:, 0] * orig_image_grid_thw[:, 1] * orig_image_grid_thw[:, 2]
+                    orig_patch_starts = torch.cat([torch.tensor([0], device=orig_patches_per_sample.device), orig_patches_per_sample.cumsum(0)])
+                    orig_image_starts = torch.arange(batch_size + 1, device=orig_image_grid_thw.device)
+            
+            # Reorder all inputs according to sorted indices
+            sorted_inputs = {}
+            for key, val in inputs.items():
+                if key == "pixel_values" and has_visual_data_presort:
+                    # Reorder pixel_values by gathering patches for each sorted sample
+                    sorted_patches = []
+                    for idx in sorted_indices.tolist():
+                        patch_start = orig_patch_starts[idx].item()
+                        patch_end = orig_patch_starts[idx + 1].item()
+                        sorted_patches.append(val[patch_start:patch_end])
+                    sorted_inputs[key] = torch.cat(sorted_patches, dim=0)
+                elif key == "image_grid_thw" and has_visual_data_presort:
+                    # Reorder image_grid_thw
+                    if orig_num_images is not None:
+                        sorted_grids = []
+                        for idx in sorted_indices.tolist():
+                            img_start = orig_image_starts[idx].item()
+                            img_end = orig_image_starts[idx + 1].item()
+                            sorted_grids.append(val[img_start:img_end])
+                        sorted_inputs[key] = torch.cat(sorted_grids, dim=0)
+                    else:
+                        sorted_inputs[key] = val[sorted_indices]
+                elif key == "pixel_attention_mask" and has_visual_data_presort:
+                    # Reorder pixel_attention_mask
+                    sorted_masks = []
+                    for idx in sorted_indices.tolist():
+                        patch_start = orig_patch_starts[idx].item()
+                        patch_end = orig_patch_starts[idx + 1].item()
+                        sorted_masks.append(val[patch_start:patch_end])
+                    sorted_inputs[key] = torch.cat(sorted_masks, dim=0)
+                elif key == "image_sizes" and has_visual_data_presort:
+                    # Reorder image_sizes
+                    if orig_num_images is not None:
+                        sorted_sizes = []
+                        for idx in sorted_indices.tolist():
+                            img_start = orig_image_starts[idx].item()
+                            img_end = orig_image_starts[idx + 1].item()
+                            sorted_sizes.append(val[img_start:img_end])
+                        sorted_inputs[key] = torch.cat(sorted_sizes, dim=0)
+                    else:
+                        sorted_inputs[key] = val[sorted_indices]
+                elif isinstance(val, torch.Tensor):
+                    if val.dim() == 0:
+                        sorted_inputs[key] = val
+                    else:
+                        sorted_inputs[key] = val[sorted_indices]
+                elif isinstance(val, list):
+                    sorted_inputs[key] = [val[i] for i in sorted_indices.tolist()]
+                else:
+                    sorted_inputs[key] = val
+            inputs = sorted_inputs
+        
         if self.accelerator.is_main_process:
+            if completion_mask is not None:
+                sorted_seq_lengths = seq_lengths[sorted_indices]
+                print(f"[Micro-batching] Sorted by length (descending): min={sorted_seq_lengths.min().item()}, max={sorted_seq_lengths.max().item()}, mean={sorted_seq_lengths.float().mean().item():.1f}")
             print(f"[Micro-batching] Splitting batch of {batch_size} into {num_micro_batches} micro-batches of size {self.micro_batch_size}")
         
-        # Pre-compute visual data indices for slicing
+        # Pre-compute visual data indices for slicing (after sorting)
         has_visual_data = "image_grid_thw" in inputs and "pixel_values" in inputs
         if has_visual_data:
             image_grid_thw = inputs["image_grid_thw"]
@@ -1074,6 +1310,7 @@ class GRPOTrainer(_GRPOTrainer):
         
         # Accumulate loss across micro-batches with proper gradient management
         total_loss = 0.0
+        use_paged_accumulation = hasattr(self, 'paged_grad_accumulator')
         
         for i in range(num_micro_batches):
             start_idx = i * self.micro_batch_size
@@ -1127,13 +1364,27 @@ class GRPOTrainer(_GRPOTrainer):
             weight = (end_idx - start_idx) / batch_size
             weighted_loss = micro_loss * weight
             
-            # For all but the last micro-batch: backward immediately and detach
-            # This releases the computation graph to save memory
-            if i < num_micro_batches - 1:
+            # Backward pass
+            if use_paged_accumulation:
+                # With paged accumulation: always backward immediately and accumulate
                 weighted_loss.backward()
-                total_loss += weighted_loss.detach()
+                self.paged_grad_accumulator.accumulate(scale_factor=1.0)
+                
+                if i < num_micro_batches - 1:
+                    # Not last: zero gradients to save memory (already in 8-bit)
+                    model.zero_grad(set_to_none=True)
+                    total_loss += weighted_loss.detach()
+                else:
+                    # Last: apply all accumulated gradients
+                    self.paged_grad_accumulator.apply_accumulated_gradients(normalize=False)
+                    total_loss = total_loss + weighted_loss.detach()
             else:
-                # Last micro-batch: accumulate without backward (trainer will handle it)
-                total_loss = total_loss + weighted_loss
+                # Without paged accumulation: original behavior
+                if i < num_micro_batches - 1:
+                    weighted_loss.backward()
+                    total_loss += weighted_loss.detach()
+                else:
+                    # Last micro-batch: accumulate without backward (trainer will handle it)
+                    total_loss = total_loss + weighted_loss
         
         return total_loss

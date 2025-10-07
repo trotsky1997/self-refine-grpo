@@ -1,4 +1,4 @@
-cd /home/diz/cvpr/
+cd "$(dirname "$0")"
 
 # Reduce memory fragmentation
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -6,7 +6,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 accelerate launch \
     --config_file fsdp1.yaml \
     grpo_vlm.py \
-    --model_name_or_path /home/diz/cvpr/Qwen2.5-VL-3B-Instruct \
+    --model_name_or_path ./Qwen2.5-VL-3B-Instruct \
     --output_dir grpo-Qwen2.5-VL-3B-Instruct \
     --learning_rate 1e-5 \
     --logging_steps 1 \
@@ -15,8 +15,8 @@ accelerate launch \
     --use_liger_loss \
     --use_liger_kernel \
     --dtype bfloat16 \
-    --max_prompt_length 2048 \
-    --max_completion_length 8192 \
+    --max_prompt_length 16384 \
+    --max_completion_length 16384 \
     --use_vllm \
     --vllm_mode colocate \
     --lora_target_modules "all-linear" \
